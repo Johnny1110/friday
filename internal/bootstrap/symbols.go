@@ -3,6 +3,7 @@ package bootstrap
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
@@ -136,11 +137,17 @@ func resolveSymbols() []orchestrator.MarketSymbol {
 	return out
 }
 
-// calibrateStrategies runs the PRD-015 startup backtest sweep: fetch recent 4h
+// calibrateStrategies runs the PRD-015 startup backtest sweep: fetch recent 5m
 // candles for each symbol, replay every strategy, and install the win-rate →
 // confidence map so the strategies vote with their real per-symbol track record
 // for the session. Best-effort — any failure (no candles, network) logs a note
 // and leaves the hardcoded confidences in place; startup always proceeds.
+//
+// The sweep runs on 5m (not 4h) on purpose: the strategies are tuned for 5m and
+// the 5m-led MTF vote weights it heaviest (5m×2.0). Calibrating on 4h scored them
+// on a timeframe they lose on, zeroed their confidence, and — because conf=0
+// disables a strategy on EVERY timeframe — silenced their 5m vote too, leaving
+// too few strategies to ever reach the ≥2-aligned consensus (perpetual NEUTRAL).
 //
 // klines is a public endpoint, so calibration runs even without trading creds.
 func calibrateStrategies(symbols []orchestrator.MarketSymbol) {
@@ -150,7 +157,7 @@ func calibrateStrategies(symbols []orchestrator.MarketSymbol) {
 
 	candles := make(map[string][]binance.Kline, len(symbols))
 	for _, s := range symbols {
-		ks, err := cli.Klines(ctx, s.Name, "4h", 200)
+		ks, err := cli.Klines(ctx, s.Name, "5m", 1500)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "friday: calibration klines fetch failed for %s (%v) — skipping it\n", s.Name, err)
 			continue
@@ -166,11 +173,44 @@ func calibrateStrategies(symbols []orchestrator.MarketSymbol) {
 	strategy.SetDefaultCalibration(cal)
 
 	calibrated := 0
-	for _, m := range cal {
-		calibrated += len(m)
+	for _, sm := range cal {
+		for _, dm := range sm {
+			calibrated += len(dm)
+		}
 	}
 	fmt.Fprintf(os.Stderr,
-		"friday: calibrated %d strategy×symbol confidence(s) from 4h backtests (the rest fall back to defaults)\n", calibrated)
+		"friday: calibrated %d strategy×symbol confidence(s) from 5m backtests (the rest fall back to defaults)\n", calibrated)
+}
+
+// startRecalibrator launches the PRD-020 §5 online re-calibration goroutine: it
+// re-runs the PRD-015 confidence sweep every FRIDAY_RECALIBRATE_HOURS (default
+// 4) on fresh 4h candles so the strategies don't vote at stale confidences all
+// session as the regime drifts. FRIDAY_RECALIBRATE_HOURS=0 disables it. The
+// backtest.Calibrate function is injected (not imported by strategy) to avoid an
+// import cycle. Runs on a background context for the life of the process.
+func startRecalibrator(symbols []orchestrator.MarketSymbol) {
+	hours := envFloat("FRIDAY_RECALIBRATE_HOURS", 4)
+	if hours <= 0 {
+		fmt.Fprintln(os.Stderr, "friday: online re-calibration disabled (FRIDAY_RECALIBRATE_HOURS=0)")
+		return
+	}
+	names := make([]string, len(symbols))
+	for i, s := range symbols {
+		names[i] = s.Name
+	}
+	cli := binance.New(binanceBaseURL(), os.Getenv("BINANCE_API_KEY"), os.Getenv("BINANCE_SECRET_KEY"))
+	rc := &strategy.Recalibrator{
+		Symbols:    names,
+		Strategies: strategy.DefaultStrategies(),
+		Interval:   time.Duration(hours * float64(time.Hour)),
+		Fetch:      cli.Klines,
+		CalibrateFn: func(strats []strategy.Strategy, candles map[string][]binance.Kline) map[string]map[string]map[string]float64 {
+			return backtest.Calibrate(strats, candles)
+		},
+		Logger: slog.Default(),
+	}
+	go rc.Run(context.Background())
+	fmt.Fprintf(os.Stderr, "friday: online re-calibration every %.1fh\n", hours)
 }
 
 // signTradFiAgreement signs the TradFi-Perps agreement so stock-perp orders are

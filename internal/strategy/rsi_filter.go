@@ -1,0 +1,110 @@
+package strategy
+
+import (
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+)
+
+// RSI extreme-zone thresholds (PRD-022 §4.1). A directional consensus formed at
+// or beyond these levels is statistically likely to mean-revert against the
+// trade — voting LONG into a peak or SHORT into a trough is exactly the pattern
+// the loss analysis flagged (SOL LONG@30, NVDA SHORT@26). The filter blocks ANY
+// directional consensus in either extreme zone, regardless of side.
+const (
+	rsiOverbought = 75.0
+	rsiOversold   = 25.0
+)
+
+// RSIFilter downgrades a directional consensus to NEUTRAL when the timeframe's
+// RSI(14) sits in an extreme zone (≥75 or ≤25) — a global gate on top of each
+// strategy's own RSI guard (PRD-022 R1). A NEUTRAL consensus, an unavailable RSI
+// (rsi == 0), or an in-range RSI passes through unchanged. Disable the whole
+// filter with FRIDAY_RSI_FILTER=false (R2).
+func RSIFilter(c Consensus, rsi float64) Consensus {
+	if !rsiFilterEnabled() {
+		return c
+	}
+	if c.Direction == Neutral || rsi == 0 {
+		return c
+	}
+	// Hard extreme zone (both sides) + a direction-aware exhaustion guard: don't
+	// SHORT into an oversold reading or LONG into an overbought one — the live
+	// loss pattern was trend strategies confirming SHORT only after RSI was already
+	// ~32 near the lows, right before the mean-reversion bounce stopped them out
+	// (PRD: entry-quality). Floor/ceiling are env-tunable; default off (0/100) so
+	// behaviour is unchanged until tuned.
+	extreme := rsi >= rsiOverbought || rsi <= rsiOversold
+	exhausted := (c.Direction == Short && rsi <= rsiShortFloor()) ||
+		(c.Direction == Long && rsi >= rsiLongCeil())
+	if extreme || exhausted {
+		c.Direction = Neutral
+		c.Confidence = 0
+		blocked := fmt.Sprintf(" (blocked: RSI %.1f in extreme zone)", rsi)
+		c.Summary = strings.TrimSpace(c.Summary) + blocked
+		// PRD-024 R12: record the block in the diagnostic detail too, so the MTF
+		// output shows an RSI-filtered TF was the reason for NEUTRAL.
+		c.SignalDetails = strings.TrimSpace(c.SignalDetails) + blocked
+		return c
+	}
+	return c
+}
+
+// --- env-configurable knobs (read per call so tests using t.Setenv take effect,
+// and an operator can flip them without a rebuild) ---
+
+// rsiFilterEnabled reports whether the RSI extreme-zone filter is active
+// (FRIDAY_RSI_FILTER, default true; "false"/"0" disables).
+func rsiFilterEnabled() bool { return envBool("FRIDAY_RSI_FILTER", true) }
+
+// rsiShortFloor / rsiLongCeil are the direction-aware exhaustion thresholds: a
+// SHORT consensus at RSI ≤ floor, or a LONG at RSI ≥ ceiling, is downgraded to
+// NEUTRAL (don't chase a move into exhaustion). Default 38 / 62: the live loss
+// pattern was trend strategies confirming SHORT only after RSI was already ~32
+// near the lows, right before the mean-reversion bounce — a 4-window MTF backtest
+// showed this guard turned the choppy windows from net-negative to net-positive.
+// Tunable via FRIDAY_RSI_SHORT_FLOOR / FRIDAY_RSI_LONG_CEIL (0 / 100 disables).
+func rsiShortFloor() float64 { return envFloat("FRIDAY_RSI_SHORT_FLOOR", 38) }
+func rsiLongCeil() float64   { return envFloat("FRIDAY_RSI_LONG_CEIL", 62) }
+
+// mtf5m1hOverrideEnabled reports whether the 5m+1h lower-timeframe override is
+// active (FRIDAY_MTF_5M1H_OVERRIDE, default true).
+func mtf5m1hOverrideEnabled() bool { return envBool("FRIDAY_MTF_5M1H_OVERRIDE", true) }
+
+// mtfQuorumEnabled reports whether the 2-of-3 MTF quorum is active when the 4h is
+// silent (FRIDAY_MTF_QUORUM, default true — PRD-024 R4). Disabling it falls back
+// to the PRD-022 weighted-sum + 5m+1h-override path.
+func mtfQuorumEnabled() bool { return envBool("FRIDAY_MTF_QUORUM", true) }
+
+// mtfHysteresisValue is the dead-band around 0 in which the weighted net is read
+// as NEUTRAL (FRIDAY_MTF_HYSTERESIS, default 0.05 — lowered from PRD-017's 0.1 so
+// aligned lower-timeframe signals are not over-filtered, PRD-022 R7).
+func mtfHysteresisValue() float64 { return envFloat("FRIDAY_MTF_HYSTERESIS", 0.05) }
+
+func envBool(key string, def bool) bool {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	switch strings.ToLower(v) {
+	case "false", "0", "no", "off":
+		return false
+	case "true", "1", "yes", "on":
+		return true
+	default:
+		return def
+	}
+}
+
+func envFloat(key string, def float64) float64 {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return def
+	}
+	return f
+}

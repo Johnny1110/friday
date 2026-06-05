@@ -98,11 +98,41 @@ func TestEMACross(t *testing.T) {
 	}
 }
 
+func TestBollinger_MeanReversionLong(t *testing.T) {
+	// 20 flat closes at 100 then a sharp drop to 95: the last close gaps below
+	// the lower band and RSI collapses (<35) → mean-reversion LONG, TP = MA20.
+	closes := append(repeat(100, 20), 95)
+	sig := Bollinger{}.Analyze("BTCUSDT", candlesFromCloses(closes...))
+	if sig.Direction != Long {
+		t.Fatalf("bollinger on a band-tag oversold = %v (%s); want Long", sig.Direction, sig.Reason)
+	}
+	if sig.TakeProfit == 0 {
+		t.Errorf("mean-reversion LONG should carry a TP (the mean), got 0")
+	}
+	if sig.Invalidation == 0 {
+		t.Errorf("mean-reversion LONG should carry an invalidation (the lower band), got 0")
+	}
+}
+
+func TestBollinger_FlatIsNeutral(t *testing.T) {
+	// A perfectly flat series sits inside the bands with no band-walk → Neutral.
+	sig := Bollinger{}.Analyze("BTCUSDT", candlesFromCloses(repeat(100, 30)...))
+	if sig.Direction != Neutral {
+		t.Errorf("flat series → %v (%s); want Neutral", sig.Direction, sig.Reason)
+	}
+}
+
+func TestBollinger_ShortSeriesNeutral(t *testing.T) {
+	if sig := (Bollinger{}).Analyze("BTCUSDT", candlesFromCloses(repeat(100, 10)...)); sig.Direction != Neutral {
+		t.Errorf("short series → %v; want Neutral", sig.Direction)
+	}
+}
+
 func TestRegistry_AppliesCalibratedConfidence(t *testing.T) {
 	// PRD-015: a calibrated base REPLACES the hardcoded 0.6, with ADX boost
 	// added on top — so a momentum Long here reads ≥0.9, not 0.6.
 	r := DefaultRegistry()
-	r.SetCalibration(map[string]float64{"momentum": 0.9})
+	r.SetCalibration(map[string]map[string]float64{"momentum": {"LONG": 0.9, "SHORT": 0.9}})
 	sigs := r.AnalyzeAll("BTCUSDT", candlesFromCloses(risingWithPullbacks(30)...))
 
 	found := false
@@ -127,15 +157,15 @@ func TestAnalyzeAll_ExcludesZeroCalibratedStrategy(t *testing.T) {
 	// PRD-016 R6: a strategy calibrated to 0 on a symbol is auto-disabled —
 	// absent from the signal list entirely.
 	r := DefaultRegistry()
-	r.SetCalibration(map[string]float64{"momentum": 0})
+	r.SetCalibration(map[string]map[string]float64{"momentum": {"LONG": 0, "SHORT": 0}})
 	sigs := r.AnalyzeAll("BTCUSDT", candlesFromCloses(risingWithPullbacks(30)...))
 	for _, s := range sigs {
 		if s.Strategy == "momentum" {
 			t.Fatal("momentum calibrated to 0 should be absent from the signal list")
 		}
 	}
-	if len(sigs) != 3 { // 4 default strategies minus the disabled momentum
-		t.Errorf("got %d signals; want 3 (momentum disabled)", len(sigs))
+	if len(sigs) != 4 { // 5 default strategies minus the disabled momentum
+		t.Errorf("got %d signals; want 4 (momentum disabled)", len(sigs))
 	}
 }
 
@@ -151,13 +181,13 @@ func TestAggregate_IgnoresZeroConfidence(t *testing.T) {
 	}
 }
 
-func TestDefaultRegistry_HasFourStrategies(t *testing.T) {
-	// PRD-013: momentum, breakout, mean-reversion, ema_cross.
+func TestDefaultRegistry_HasFiveStrategies(t *testing.T) {
+	// PRD-013: momentum, breakout, mean-reversion, ema_cross. PRD-020 §7: bollinger.
 	sigs := DefaultRegistry().AnalyzeAll("BTCUSDT", candlesFromCloses(repeat(100, 60)...))
-	if len(sigs) != 4 {
-		t.Fatalf("DefaultRegistry produced %d signals; want 4", len(sigs))
+	if len(sigs) != 5 {
+		t.Fatalf("DefaultRegistry produced %d signals; want 5", len(sigs))
 	}
-	want := map[string]bool{"momentum": true, "breakout": true, "mean_reversion": true, "ema_cross": true}
+	want := map[string]bool{"momentum": true, "breakout": true, "mean_reversion": true, "ema_cross": true, "bollinger": true}
 	for _, s := range sigs {
 		delete(want, s.Strategy)
 	}
@@ -199,14 +229,15 @@ func TestAggregateMTF(t *testing.T) {
 		t.Errorf("all-LONG → %v %.2f; want LONG >0", c.Direction, c.Confidence)
 	}
 
-	// 5m LONG 0.7 (+0.7), 1h NEUTRAL (0), 4h SHORT 0.6 (−1.2) → net −0.5 → SHORT.
+	// 5m LONG 0.7 (×2.0=+1.4), 1h NEUTRAL, 4h SHORT 0.6 (×0.5=−0.3) → net +1.1 →
+	// LONG, which opposes 4h → veto → NEUTRAL. With new weights 5m dominates.
 	c := AggregateMTF(map[string]Consensus{"5m": long(0.7), "1h": neutral, "4h": short(0.6)})
-	if c.Direction != Short {
-		t.Errorf("5m LONG / 4h SHORT → %v (%s); want SHORT (4h dominates)", c.Direction, c.Summary)
+	if c.Direction != Neutral {
+		t.Errorf("5m LONG / 4h SHORT → %v (%s); want NEUTRAL (4h veto, 5m dominates)", c.Direction, c.Summary)
 	}
 	// Summary carries every TF's contribution in canonical order (the tool prints
 	// it verbatim as the "MTF Strategy:" line).
-	for _, want := range []string{"5m:LONG 0.70", "1h:NEUTRAL", "4h:SHORT 0.60", "weighted SHORT"} {
+	for _, want := range []string{"5m:LONG 0.70", "1h:NEUTRAL", "4h:SHORT 0.60", "4h veto"} {
 		if !strings.Contains(c.Summary, want) {
 			t.Errorf("MTF summary %q missing %q", c.Summary, want)
 		}

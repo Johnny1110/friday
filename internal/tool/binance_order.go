@@ -5,13 +5,111 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/johnny1110/evva/pkg/tools"
 	"github.com/johnny1110/friday/internal/binance"
 	"github.com/johnny1110/friday/internal/risk"
 )
+
+// Maker-entry knobs (PRD: cut fees — taker is ~45% of live losses). Opt-in via
+// FRIDAY_MAKER_ENTRY: an OPENING order is first placed as a post-only LIMIT (GTX,
+// maker fee) at the mark; if it won't rest or doesn't fill within the poll
+// window, it falls back to a MARKET taker so the entry always happens. reduce_only
+// closes always go MARKET — a flatten must never sit unfilled.
+const (
+	makerPollAttempts = 5
+	makerPollInterval = 800 * time.Millisecond
+)
+
+func makerEntryEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("FRIDAY_MAKER_ENTRY"))) {
+	case "true", "1", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// makerSuitableStrategy reports whether an entry's strategy is a PASSIVE,
+// fade-type setup for which a post-only maker LIMIT can realistically fill.
+// Mean-reversion / Bollinger entries buy a dip / sell a rip — price is reverting
+// TOWARD the entry, so a maker order at the mark rests and gets filled as the
+// market ticks into it. Momentum / breakout / ema_cross CHASE the move — price
+// runs AWAY from a passive limit, so a maker entry there just rejects or times
+// out and falls back to taker anyway (the live finding behind this gate). For
+// those, and for an unknown/blank strategy, go straight to a taker MARKET so the
+// entry isn't missed. Matching is substring + case-insensitive so "mean_reversion",
+// "mean-reversion", "MeanReversion", "bollinger" all hit.
+func makerSuitableStrategy(strategy string) bool {
+	s := strings.ToLower(strings.TrimSpace(strategy))
+	return strings.Contains(s, "mean") || strings.Contains(s, "boll")
+}
+
+// placeEntryOrder fills `quantity`, preferring a post-only maker LIMIT (half the
+// fee) and falling back to a MARKET taker if it won't rest or doesn't fully fill.
+// reduce_only, maker disabled, or a momentum/breakout (non-passive) strategy →
+// straight MARKET (see makerSuitableStrategy).
+func placeEntryOrder(ctx context.Context, cli *binance.Client, logger *slog.Logger, symbol string, side binance.OrderSide, quantity float64, reduceOnly bool, strategy string) (*binance.OrderResponse, error) {
+	if reduceOnly {
+		return cli.MarketOrder(ctx, symbol, side, quantity, true) // a close never rests
+	}
+	if !makerEntryEnabled() || !makerSuitableStrategy(strategy) {
+		recordEntryFill(symbol, "taker")
+		return cli.MarketOrder(ctx, symbol, side, quantity, false)
+	}
+	taker := func() (*binance.OrderResponse, error) {
+		recordEntryFill(symbol, "taker")
+		return cli.MarketOrder(ctx, symbol, side, quantity, false)
+	}
+	mp, err := cli.Price(ctx, symbol)
+	if err != nil || mp == nil || mp.MarkPrice == "" {
+		return taker()
+	}
+	ord, err := cli.LimitMakerOrder(ctx, symbol, side, quantity, mp.MarkPrice, false)
+	if err != nil || ord == nil || ord.Status == "EXPIRED" || ord.Status == "REJECTED" {
+		logger.Debug("binance_order.maker_no_rest_fallback_market", "symbol", symbol, "err", err)
+		return taker()
+	}
+	if ord.Status == "FILLED" {
+		recordEntryFill(symbol, "maker")
+		return ord, nil
+	}
+	for i := 0; i < makerPollAttempts; i++ {
+		time.Sleep(makerPollInterval)
+		q, qerr := cli.QueryOrder(ctx, symbol, ord.OrderID)
+		if qerr != nil {
+			continue
+		}
+		ord = q
+		if ord.Status == "FILLED" {
+			recordEntryFill(symbol, "maker")
+			return ord, nil
+		}
+		if ord.Status == "CANCELED" || ord.Status == "EXPIRED" || ord.Status == "REJECTED" {
+			break
+		}
+	}
+	// Not fully filled: cancel the rest and MARKET the unfilled remainder so the
+	// position still reaches the intended size (the stop is registered for it).
+	_ = cli.CancelOrder(ctx, symbol, ord.OrderID)
+	executed, _ := strconv.ParseFloat(ord.ExecutedQty, 64)
+	if remainder := quantity - executed; remainder > 0 {
+		logger.Debug("binance_order.maker_partial_market_remainder", "symbol", symbol, "executed", executed, "remainder", remainder)
+		// Partial maker + market remainder → predominantly taker; label by the
+		// larger leg so the notification isn't misleading.
+		if executed >= remainder {
+			recordEntryFill(symbol, "maker+taker")
+		} else {
+			recordEntryFill(symbol, "taker")
+		}
+		return cli.MarketOrder(ctx, symbol, side, remainder, false)
+	}
+	recordEntryFill(symbol, "maker")
+	return ord, nil
+}
 
 // guardrailMaxMarginPct is the hard ceiling the pre-trade guardrail
 // enforces: an opening order's margin may not exceed this fraction of the
@@ -49,7 +147,8 @@ const binanceOrderSchema = `{
 		"symbol":      {"type": "string", "description": "Binance Futures symbol, e.g. BTCUSDT."},
 		"side":        {"type": "string", "enum": ["BUY", "SELL"], "description": "BUY = long / close short; SELL = short / close long."},
 		"quantity":    {"type": "number", "exclusiveMinimum": 0, "description": "Quantity in base asset, e.g. 0.002. Must respect symbol step size."},
-		"reduce_only": {"type": "boolean", "default": false, "description": "If true, order can only reduce/close an existing position."}
+		"reduce_only": {"type": "boolean", "default": false, "description": "If true, order can only reduce/close an existing position."},
+		"strategy":    {"type": "string", "description": "OPTIONAL. The strategy that triggered this OPEN (momentum / breakout / mean_reversion / ema_cross / bollinger / divergence), from the Risk Manager's reason. When FRIDAY_MAKER_ENTRY is on, a passive fade strategy (mean_reversion / bollinger) is entered as a post-only maker LIMIT to halve the fee; momentum/breakout and all closes stay MARKET. Ignored for reduce_only."}
 	}
 }`
 
@@ -66,6 +165,7 @@ type binanceOrderInput struct {
 	Side       string  `json:"side"`
 	Quantity   float64 `json:"quantity"`
 	ReduceOnly bool    `json:"reduce_only,omitempty"`
+	Strategy   string  `json:"strategy,omitempty"`
 }
 
 func (BinanceOrderTool) Execute(ctx context.Context, logger *slog.Logger, raw json.RawMessage) (tools.Result, error) {
@@ -82,6 +182,13 @@ func (BinanceOrderTool) Execute(ctx context.Context, logger *slog.Logger, raw js
 	}
 	if in.Quantity <= 0 {
 		return tools.Result{IsError: true, Content: fmt.Sprintf("binance_order: quantity=%g must be > 0", in.Quantity)}, nil
+	}
+
+	// Paper-trading mode (PRD-021 §4): no real order. Fetch the mark (real
+	// market data), update the virtual book, and report what WOULD have happened.
+	// The exchange's account endpoints are never touched.
+	if globalPaper != nil {
+		return paperOrder(ctx, logger, in, side)
 	}
 
 	// Circuit breaker (PRD-005): session-level gate, BEFORE the per-trade
@@ -139,23 +246,118 @@ func (BinanceOrderTool) Execute(ctx context.Context, logger *slog.Logger, raw js
 		}
 	}
 
+	// Fee-budget guardrail (PRD-020 §3): block a new OPENING when fee spend over
+	// the rolling window has exceeded the cap (anti-overtrading). Needs the live
+	// balance, so it runs after the snapshot. Reduce-only closes bypass.
+	if !in.ReduceOnly && snapErr == nil && globalFeeBudget != nil {
+		if ferr := globalFeeBudget.Check(acct.WalletBalance); ferr != nil {
+			logger.Info("binance_order.fee_budget_blocked", "symbol", in.Symbol, "reason", ferr.Error())
+			return tools.Result{IsError: true, Content: ferr.Error()}, nil
+		}
+	}
+
+	ro := risk.Order{
+		Symbol:     in.Symbol,
+		Side:       in.Side,
+		Quantity:   in.Quantity,
+		ReduceOnly: in.ReduceOnly,
+	}
+
+	// Portfolio-group guardrail (PRD-020 §4): block an OPENING that pushes a
+	// correlated group's COMBINED margin over its cap. Needs the margin already
+	// committed by the group's OTHER open positions, so fetch them and sum.
+	if !in.ReduceOnly && snapErr == nil && globalPortfolioValidator != nil {
+		if _, cfg, ok := globalPortfolioValidator.Limits.GroupFor(in.Symbol); ok {
+			acct.GroupUsedMargin = groupUsedMargin(ctx, cli, cfg, in.Symbol, logger)
+			if perr := globalPortfolioValidator.Validate(ro, acct); perr != nil {
+				logger.Info("binance_order.portfolio_blocked", "symbol", in.Symbol, "reason", perr.Error())
+				return tools.Result{IsError: true, Content: perr.Error()}, nil
+			}
+		}
+	}
+
 	if snapErr == nil {
-		if verr := orderValidator.Validate(risk.Order{
-			Symbol:     in.Symbol,
-			Side:       in.Side,
-			Quantity:   in.Quantity,
-			ReduceOnly: in.ReduceOnly,
-		}, acct); verr != nil {
+		if verr := orderValidator.Validate(ro, acct); verr != nil {
 			logger.Info("binance_order.guardrail_blocked", "symbol", in.Symbol, "reason", verr.Error())
 			return tools.Result{IsError: true, Content: verr.Error()}, nil
 		}
 	}
 
-	ord, err := cli.MarketOrder(ctx, in.Symbol, side, in.Quantity, in.ReduceOnly)
+	ord, err := placeEntryOrder(ctx, cli, logger, in.Symbol, side, in.Quantity, in.ReduceOnly, in.Strategy)
 	if err != nil {
 		return tools.Result{IsError: true, Content: fmt.Sprintf("binance_order: %v", err)}, nil
 	}
 	return tools.Result{Content: guardNote + binance.FormatOrder(ord)}, nil
+}
+
+// groupUsedMargin sums the margin (|notional| ÷ leverage) committed by the
+// OTHER open positions in a correlated group (PRD-020 §4) — the exposure the
+// PortfolioGroupValidator adds to this order's margin before checking the group
+// cap. The order's own symbol is excluded (its fresh margin is added by the
+// validator). Best-effort: a fetch failure logs and returns 0 (the group gate
+// then only sees this order, never over-counting).
+func groupUsedMargin(ctx context.Context, cli *binance.Client, cfg risk.GroupConfig, excludeSymbol string, logger *slog.Logger) float64 {
+	members := make(map[string]bool, len(cfg.Symbols))
+	for _, s := range cfg.Members(excludeSymbol) {
+		members[s] = true
+	}
+	if len(members) == 0 {
+		return 0
+	}
+	open, err := cli.OpenPositions(ctx)
+	if err != nil {
+		logger.Warn("binance_order.group_exposure_failed", "err", err)
+		return 0
+	}
+	var used float64
+	for _, p := range open {
+		if !members[p.Symbol] {
+			continue
+		}
+		amt, _ := strconv.ParseFloat(p.PositionAmt, 64)
+		mark, _ := strconv.ParseFloat(p.MarkPrice, 64)
+		lev, _ := strconv.ParseFloat(p.Leverage, 64)
+		notional := abs(amt) * mark
+		if lev > 0 {
+			used += notional / lev
+		} else {
+			used += notional
+		}
+	}
+	return used
+}
+
+func abs(v float64) float64 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+// paperOrder applies a market order to the virtual book at the live mark price
+// (PRD-021 §4) — market data is real, the fill is virtual. Reduce-only reduces
+// the position (realising virtual PnL); otherwise it opens/adds.
+func paperOrder(ctx context.Context, logger *slog.Logger, in binanceOrderInput, side binance.OrderSide) (tools.Result, error) {
+	cli, err := sharedBinanceClient()
+	if err != nil {
+		return tools.Result{IsError: true, Content: err.Error()}, nil
+	}
+	mp, err := cli.Price(ctx, in.Symbol)
+	if err != nil {
+		return tools.Result{IsError: true, Content: fmt.Sprintf("binance_order (paper): price: %v", err)}, nil
+	}
+	mark, _ := strconv.ParseFloat(mp.MarkPrice, 64)
+	if mark <= 0 {
+		return tools.Result{IsError: true, Content: fmt.Sprintf("binance_order (paper): no mark price for %s", in.Symbol)}, nil
+	}
+	realised := globalPaper.Trade(in.Symbol, string(side), in.Quantity, mark, in.ReduceOnly)
+	logger.Info("binance_order.paper", "symbol", in.Symbol, "side", side, "qty", in.Quantity,
+		"mark", mark, "reduce_only", in.ReduceOnly, "realised", realised)
+	msg := fmt.Sprintf("PAPER: would have placed %s %s qty=%g @ ~%.4f (no real order).", in.Symbol, side, in.Quantity, mark)
+	if in.ReduceOnly {
+		msg += fmt.Sprintf(" Virtual realised PnL %+.4f USDT. Virtual balance now %.2f.", realised, globalPaper.Balance())
+	}
+	return tools.Result{Content: msg}, nil
 }
 
 // orderGuardSnapshot pulls the live wallet balance, mark price, and

@@ -1,16 +1,24 @@
 # Friday Roadmap
 
-Three tranches of work. The **4-phase upgrade** (PRD-001..004) from
-[`plan.md`](./plan.md) and the **P0 safety/strategy** tranche (PRD-005..006)
-from the P0/P1 plans in [`.evva/plans/`](../.evva/plans/), and the **P1**
-tranche (PRD-007..009) are all complete. Together they push Friday from "LLM as
-trader" toward "LLM as supervisor over deterministic Go strategy + hard safety
-rails". A separate **operational-hardening** tranche (PRD-010..012, PRD-019)
-captures fixes that came out of running real testnet sessions.
+The index of Friday's deliverables — one PRD per row in [`docs/PRD/`](./PRD/).
+The arc pushes Friday from "LLM as trader" toward "LLM as supervisor over a
+deterministic Go strategy engine behind hard, code-enforced safety rails":
+
+- **4-phase upgrade** (PRD-001..004) — semantic data + ReAct, sentiment + margin guardrail, the multi-agent refactor, vector memory + backtest. *(plan: [`plan.md`](./plan.md))*
+- **P0 safety/strategy** (PRD-005..006) — circuit breakers + the deterministic strategy layer.
+- **P1 volatility/stops/MTF** (PRD-007..009) — ATR sizing, multi-timeframe reads, the stop-loss monitor.
+- **Operational hardening** (PRD-010..012, 019) — fixes surfaced by real testnet sessions.
+- **P2 strategy-engine hardening** (PRD-013..018) — portfolio expansion, per-strategy tracking, confidence calibration, regime detection, MTF consensus, strategy-aware exits.
+- **P3 production + operations** (PRD-020..023) — native stops / fee budget / portfolio caps / online re-calibration / paper mode / observability, plus PnL-analysis-driven signal (022) and Analyst (023) hardening.
+
+**Status: PRD-001–024 are all implemented** (PRD-023's testnet-session and
+PRD-024's paper-mode acceptance items await a live run). Per-PRD detail and
+deferred follow-ups live in each `docs/PRD/PRD-NNN.md`; the sections below track
+them with checkboxes.
 
 ---
 
-## ⚠️ Architecture-alignment note (read before implementing PRD-007+)
+## ⚠️ Architecture-alignment note (when reading the old P0/P1 plan docs)
 
 The P0/P1 plans were written against the **pre-refactor single-agent**
 codebase. PRD-003 has since replaced that with the multi-agent
@@ -134,7 +142,34 @@ The P2 tranche (PRD-013..018) is now **complete**, built in dependency order:
 014's strategy attribution) → `PRD-016` (regime, needs 015's calibrated weights)
 → `PRD-017` (MTF voting) + `PRD-018` (strategy-aware exits).
 
-All PRDs (001–019) are now implemented.
+All PRDs (001–024) are now implemented (PRD-023's testnet-session and PRD-024's paper-mode acceptance items await a live run).
+
+---
+
+## Planned — P4: signal quantity + MTF responsiveness + Analyst resilience
+
+Source: [`.evva/plans/current.md`](../.evva/plans/current.md) — 106-round live-data analysis
+
+The 106-round live-data analysis revealed MTF Strategy is NEUTRAL for 97% of rounds
+(only 3 actionable rounds out of 106) and the Analyst collapses to one-word "凍結"
+summaries after 80+ consecutive NEUTRAL rounds. This tranche fixes the structural
+bottlenecks (5m candle count starving the strategy engine), relaxes the MTF
+aggregation (quorum voting + lower override threshold), prevents Analyst degradation,
+and adds per-strategy observability so NEUTRAL rounds are diagnosable.
+
+- [x] **[PRD-024](./PRD/PRD-024.md)** — Signal Quantity & MTF Responsiveness &
+  Analyst Resilience. ✅ Four changes: (1) 5m candle count 20→96 (`binance_mtf_klines`)
+  so all 5 strategies — EMACross needs 50 — can vote on the entry timeframe; (2) MTF
+  2-of-3 quorum when 4h is NEUTRAL (`FRIDAY_MTF_QUORUM`, default on) + 5m+1h override
+  floor lowered 0.5→0.35 (the PRD-022 4h hard veto is unchanged — it still fires only
+  when the *weighted* result opposes a directional 4h, so a lone lower-TF dissent does
+  not block a with-4h trade); (3) Analyst-prompt anti-degradation rule (always write a
+  concrete per-symbol summary, never "凍結") + Cross-TF-divergence flag + a
+  `consecutiveNeutral` counter that injects a vigilance warning into the carry after 10
+  flat rounds (`carryWithNeutralWarning`, strip-then-append); (4) per-strategy
+  `Consensus.SignalDetails` rendered as indented lines beneath the MTF Strategy line so
+  a NEUTRAL round shows *why* (which strategies fired / conflicted / were RSI-filtered).
+  Depends on PRD-006/017/022.
 
 ---
 
@@ -147,19 +182,48 @@ categories: production hardening (safety gaps only code can close, signal
 improvements the backtest infrastructure enables) and operations (tooling to
 make the system observable and testable without real money).
 
-- [ ] **[PRD-020](./PRD/PRD-020.md)** — Production Hardening (Safety + Signal).
-  Six changes within the trading loop: native STOP_MARKET orders for
-  crash-survivable stop-loss, a fee-budget guardrail against overtrading,
-  portfolio-level correlation-aware position sizing, online strategy
-  re-calibration, strategy-specific take-profit levels, and a Bollinger Band
-  strategy. Depends on PRD-005/006/007/009/010/011/015.
-- [ ] **[PRD-021](./PRD/PRD-021.md)** — Operations & Observability. Three
-  operator-facing tools: `cmd/analyze` for session post-mortem analysis
-  (per-strategy win rate, per-symbol PnL, Analyst accuracy, breaker timeline),
-  Discord/Telegram webhook notifications for critical events (breaker trips,
-  large PnL), and `FRIDAY_PAPER=true` paper trading mode with a virtual
-  portfolio for safe strategy validation. Depends on PRD-003/004/005 +
-  roundlog.go.
+- [x] **[PRD-020](./PRD/PRD-020.md)** — Production Hardening (Safety + Signal). ✅
+  Six changes within the trading loop: native STOP_MARKET/TAKE_PROFIT_MARKET
+  orders for crash-survivable stops (`binance_stop_monitor` places them alongside
+  the in-memory monitor; startup orphan cleanup in `main`), a fee-budget
+  guardrail (`risk.FeeBudget`, blocks new OPENs in `binance_order`, fed by
+  `log_trade`), portfolio correlation-group caps (`risk.PortfolioGroupValidator`,
+  crypto 30% / stocks 40%, `FRIDAY_GROUP_LIMITS`), online re-calibration
+  (`strategy.Recalibrator`, every `FRIDAY_RECALIBRATE_HOURS`), strategy-specific
+  take-profits (`Signal.TakeProfit` — breakout measured move, mean-reversion/
+  bollinger the mean — rendered as `tp=…`; `backtest.BestTakeProfit` sweep), and a
+  Bollinger Band strategy (5th vote: mean-reversion + band-walk). Depends on
+  PRD-005/006/007/009/010/011/015.
+- [x] **[PRD-021](./PRD/PRD-021.md)** — Operations & Observability. ✅ Three
+  operator-facing tools: `cmd/analyze` for session post-mortem analysis (6
+  sections — overview, per-strategy/symbol/regime stats with profit factor,
+  Analyst directional accuracy, breaker timeline; `-json` + path flags; reads
+  rounds.jsonl + trades.jsonl, graceful on missing files), `internal/notify`
+  Discord/Telegram webhook notifications (`NewFromEnv`; session start/stop +
+  breaker PAUSED/HALTED transitions deduped in the orchestrator, large-PnL
+  closes ≥`FRIDAY_NOTIFY_PNL_PCT` in `log_trade`), and `FRIDAY_PAPER=true` paper
+  trading (`risk.PaperPortfolio`; trading tools become virtual no-ops, market
+  data stays live, paper StopMonitor broker, round/trade logs tagged
+  `paper:true`). Round log now records per-symbol regime for the post-mortem.
+  Depends on PRD-003/004/005 + roundlog.go.
+- [x] **[PRD-022](./PRD/PRD-022.md)** — Strategy Signal Quality: RSI Entry Filter
+  + MTF Responsiveness. ✅ `strategy.RSIFilter` (`rsi_filter.go`) blocks any
+  directional consensus when the TF's RSI(14) is in an extreme zone (≥75 or ≤25),
+  applied per-TF inside `AggregateMTF`; `Consensus` gained an `RSI` field populated
+  by `ConsensusWithRegime`; `binance.ClosesOf` exported. MTF hysteresis lowered
+  0.1→0.05 (`FRIDAY_MTF_HYSTERESIS`), a 5m+1h consensus override fires when the 4h
+  is NEUTRAL and both lower TFs agree ≥0.5 (`FRIDAY_MTF_5M1H_OVERRIDE`), and 4h
+  opposition is now a hard veto. Env knobs: `FRIDAY_RSI_FILTER`. Depends on PRD-006/017.
+- [x] **[PRD-023](./PRD/PRD-023.md)** — Analyst Decision Quality: Regime Clamp
+  + Fee Awareness + Recall Fix. ✅ Three Analyst-prompt rules (regime-aware bias
+  clamp — no counter-trend LONG in a bearish 4h trend without MTF-LONG + extreme
+  fear; fee-aware sizing — expected move must clear ≥3× round-trip fee; recall
+  sample-size reminder) + the fee-budget surfaced into the round carry when near
+  the cap (`carryWithFeeWarning`, strip-then-append) + a recall minimum-sample
+  threshold (`memory.SimilarConclusive` / `ConclusiveMinSamples=5`; `recall_trades`
+  prints "insufficient data (<5 similar trades) — do not use this to veto" on a
+  thin pool, breaking the losses→never-trade feedback loop). Depends on
+  PRD-003/004/016/020.
 
 ---
 

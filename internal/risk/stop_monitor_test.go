@@ -31,7 +31,7 @@ func (m *mockBroker) CloseReduceOnly(_ context.Context, symbol string, qty float
 }
 
 func newTestMonitor(b StopBroker) *StopMonitor {
-	return NewStopMonitor(b, time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return NewStopMonitor(b, time.Second, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 }
 
 func TestStopMonitor_LongStopFires(t *testing.T) {
@@ -55,6 +55,39 @@ func TestStopMonitor_ShortStopFires(t *testing.T) {
 	m.check(context.Background())
 	if len(b.closes) != 1 || b.closes[0].side != DirShort {
 		t.Fatalf("expected one SHORT close, got %+v", b.closes)
+	}
+}
+
+func TestStopMonitor_PeakTracking(t *testing.T) {
+	b := &mockBroker{price: 102}
+	m := newTestMonitor(b)
+	// LONG entry 100, qty 2, stop far below so it never fires across polls.
+	m.SetLevels("BTCUSDT", StopLevels{StopPrice: 90, PositionQty: 2, PositionSide: DirLong, EntryPrice: 100})
+
+	if _, ok := m.PeakPnL("BTCUSDT"); ok {
+		t.Fatal("no observation yet → PeakPnL should report ok=false")
+	}
+	b.price = 102 // uPnL = (102-100)*2 = +4
+	m.check(context.Background())
+	b.price = 105 // uPnL = +10  (new peak)
+	m.check(context.Background())
+	b.price = 103 // uPnL = +6   (below peak — peak must hold)
+	m.check(context.Background())
+
+	if peak, ok := m.PeakPnL("BTCUSDT"); !ok || peak != 10 {
+		t.Errorf("peak = %v (ok=%v); want 10", peak, ok)
+	}
+
+	// A new position (different entry) resets the peak.
+	m.SetLevels("BTCUSDT", StopLevels{StopPrice: 95, PositionQty: 2, PositionSide: DirLong, EntryPrice: 110})
+	if _, ok := m.PeakPnL("BTCUSDT"); ok {
+		t.Error("re-arm with a new entry should reset the peak (ok=false until next poll)")
+	}
+
+	// Closing the position clears the peak.
+	m.SetLevels("BTCUSDT", StopLevels{})
+	if _, ok := m.PeakPnL("BTCUSDT"); ok {
+		t.Error("clearing levels should drop the peak")
 	}
 }
 
@@ -119,7 +152,7 @@ func TestStopMonitor_PriceErrorSkips(t *testing.T) {
 }
 
 func TestStopMonitor_StartStopsOnContextCancel(t *testing.T) {
-	m := NewStopMonitor(&mockBroker{price: 105}, time.Millisecond, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	m := NewStopMonitor(&mockBroker{price: 105}, time.Millisecond, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { m.Start(ctx); close(done) }()
